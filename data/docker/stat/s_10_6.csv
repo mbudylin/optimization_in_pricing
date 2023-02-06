@@ -1,0 +1,10 @@
+N,seed,solver,opt_type,t,status
+10,6,scipy.slsqp,NLP,0.006499052047729492,ok
+10,6,scipy.cobyla,NLP,0.007264375686645508,1
+10,6,scipy.trust-constr,NLP,0.07205700874328613,1
+10,6,pyomo.ipopt,NLP,0.04221963882446289,ok
+10,6,pyomo.cbc,MILP,0.049024105072021484,ok
+10,6,pyomo.glpk,MILP,0.03254294395446777,ok
+10,6,cvxpy.cbc,MILP,0.022210359573364258,optimal
+10,6,cvxpy.glpk,MILP,0.016530275344848633,optimal
+10,6,cvxpy.ecos,MILP,0.016208648681640625,optimal
