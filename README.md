@@ -19,7 +19,7 @@ conda activate opt_conda_env
 ```
 3. Установка необходимых пакетов
 ```
-conda install -c conda-forge conda_requirements.txt
+conda install -c conda-forge --file conda_requirements.txt
 ```
 4. Добавление окружения в jupyter
 ```

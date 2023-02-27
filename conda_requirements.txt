@@ -3,7 +3,6 @@ pandas
 matplotlib
 seaborn
 pyomo
-pyoptsparse
 cvxpy
 cvxopt
 coincbc
