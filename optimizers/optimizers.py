@@ -4,7 +4,7 @@
 from typing import Dict
 import abc
 import numpy as np
-from scipy.optimize import NonlinearConstraint, LinearConstraint, minimize
+from scipy.optimize import NonlinearConstraint, LinearConstraint, minimize, linprog
 import cvxpy as cp
 import pyomo.environ as pyo
 
@@ -76,6 +76,7 @@ class OptimizationModel(abc.ABC):
             if add_method is None:
                 # такой метод не реализован
                 continue
+            print(f'Добавлено ограничение {con_name} с параметрами {str(param)}')
             add_method(param)
 
     @abc.abstractmethod
@@ -134,13 +135,13 @@ class ScipyNlpOptimizationModel(OptimizationModel):
         constr = NonlinearConstraint(con_mrg, m_min / self.k, np.inf)
         self.constraints['con_mrg'] = constr
 
-    def solve(self, solver='slsqp', options={}):
-
+    def solve(self, solver='slsqp', options=None):
+        opts = {} if options is None else options
         result = minimize(self.obj,
                           self.x0,
                           method=solver,
-                          constraints=self.constraints.values(),
-                          options=options)
+                          constraints=self.constraints,
+                          options=opts)
 
         self.data['x_opt'] = result['x'][self.plu_line_idx[self.plu_idx]]
         self.data['P_opt'] = self.data['x_opt'] * self.data['P']
@@ -354,9 +355,10 @@ class CvxpyLpOptimizationModel(OptimizationModel):
         ) >= sum(self.n_plu) - nmax
         self.constraints['con_chg_cnt'] = con_chg_cnt
 
-    def solve(self, solver='ECOS_BB', options={}):
-        problem = cp.Problem(self.obj, self.constraints.values())
-        problem.solve(solver, **options)
+    def solve(self, solver='ECOS_BB', options=None):
+        options_ = {} if options is None else options
+        problem = cp.Problem(self.obj, list(self.constraints.values()))
+        problem.solve(solver, **options_)
 
         if self.x.value is None:
             return {
@@ -383,4 +385,108 @@ class CvxpyLpOptimizationModel(OptimizationModel):
             'model': problem,
             'data': self.data,
             'opt_idx': x_opt_idx
+        }
+
+
+class ScipyLpOptimizationModel(OptimizationModel):
+    def __init__(self, data):
+        super().__init__(data, 'data_milp')
+        self.grid_size = self.data['grid_size'].values
+        self.g_max = max(self.data['grid_size'])
+        self.plu_line_idx = self.data['plu_line_idx'].values
+        self.n_plu_line = self.data.shape[0]
+        self.n_plu = self.data['n_plu'].values
+        self.n_vars = self.n_plu_line * self.g_max
+        self.P_idx = self.data['P_idx'].values
+        self.Ps = np.array(self.data['Ps'].to_list()).reshape(-1)
+        self.Qs = np.array(self.data['Qs'].to_list()).reshape(-1)
+        self.Cs = np.repeat(self.data['C'].values.reshape(-1), self.g_max)
+        # границы для индексов
+        self.xs = np.array(self.data['xs'].to_list())
+        self.ix_beg = np.arange(self.n_plu_line) * self.g_max
+        self.ix_end = self.ix_beg + self.grid_size
+        self.ix_cur = self.ix_beg + self.data['P_idx'].to_numpy()
+        # Задаём объекты для формирования
+        self.x_bounds = None
+        self.var_types = None
+        self.c_obj = None
+        self.constraints = {}
+
+    def init_variables(self):
+
+        self.x_bounds = [(0, 1)] * self.n_vars
+        self.var_types = [1] * self.n_vars
+
+        a_var_any_price = np.zeros((self.n_plu_line, self.n_vars))
+        for r, (i_beg, i_end) in enumerate(zip(self.ix_beg, self.ix_end)):
+            a_var_any_price[r, i_beg:i_end] = 1
+        b_var_any_price = np.ones(self.n_plu_line)
+        self.constraints['var_any_price'] = [
+            'eq', a_var_any_price, b_var_any_price
+        ]
+
+    def init_objective(self):
+        self.c_obj = - self.Ps * self.Qs
+
+    def add_con_mrg(self, m_min):
+        a_con_mrg = ((self.Ps - self.Cs) * self.Qs).reshape(1, -1)
+        b_con_mrg = np.array([m_min])
+        self.constraints['con_mrg'] = [
+            'lb', a_con_mrg, b_con_mrg
+        ]
+
+    def add_con_chg_cnt(self, n_chg_max=10000):
+        a_chg_cnt = self.n_plu.reshape(1, -1)
+        a_chg_cnt[0, self.ix_cur] = 1
+        b_chg_cnt = np.array([self.n_plu_line - n_chg_max])
+        self.constraints['con_chg_cnt'] = [
+            'lb', a_chg_cnt, b_chg_cnt
+        ]
+
+    def _union_constraints(self):
+        a_ub_list, b_ub_list = [], []
+        a_eq_list, b_eq_list = [], []
+
+        for con_name, con in self.constraints.items():
+            if con[0] == 'eq':
+                a_eq_list.append(con[1])
+                b_eq_list.append(con[2])
+            if con[0] == 'lb':
+                a_ub_list.append(-con[1])
+                b_ub_list.append(-con[2])
+            if con[0] == 'ub':
+                a_ub_list.append(con[1])
+                b_ub_list.append(con[2])
+        a_ub, b_ub, a_eq, b_eq = None, None, None, None
+        if len(a_ub_list) > 0:
+            a_ub = np.vstack(a_ub_list)
+            b_ub = np.concatenate(b_ub_list)
+        if len(a_eq_list) > 0:
+            a_eq = np.vstack(a_eq_list)
+            b_eq = np.concatenate(b_eq_list)
+
+        return a_ub, b_ub, a_eq, b_eq
+
+    def solve(self, solver='highs', options=None):
+        c_obj = self.c_obj
+        a_ub, b_ub, a_eq, b_eq = self._union_constraints()
+        result = linprog(
+            c=c_obj, A_ub=a_ub, b_ub=b_ub, A_eq=a_eq, b_eq=b_eq,
+            bounds=self.x_bounds, integrality=self.var_types, method=solver,
+            options=options
+        )
+        print(a_ub.shape, a_eq.shape)
+        message = result['message']
+        status = 'ok' if result['status'] == 0 else result['status']
+        x_opt_idx = np.where(result['x'] == 1)
+        self.data['P_opt'] = self.Ps[x_opt_idx]
+        self.data['Q_opt'] = self.Qs[x_opt_idx]
+        x_opt_idx = x_opt_idx - self.ix_beg
+        self.data['x_opt'] = x_opt_idx[0]
+        return {
+            'message': message,
+            'status': status,
+            'model': result,
+            'data': self.data,
+            'x_opt_idx': x_opt_idx
         }
